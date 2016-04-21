@@ -41,8 +41,8 @@ class Q(object):
                 op = 'ids'
                 name = 'values'
             elif op in {'gt', 'gte', 'lt', 'lte'}:
-                op = 'range'
                 value = {op: value}
+                op = 'range'
 
             self._list.append({_Q_OP_MAP.get(op, op): {name: value}})
 
@@ -53,6 +53,11 @@ class Q(object):
 
     def merge(self, t, logic):
         assert isinstance(t, Q)
+
+        if self.empty():
+            return t.clone()
+        if t.empty():
+            return self.clone()
 
         if len(self._list) == 1 or self._logic == logic:
             if len(t._list) == 1 or t._logic == logic:
@@ -68,7 +73,7 @@ class Q(object):
 
         else:
             q = self.__class__()
-            q._list = [self.to_dict() + t.to_dict()]
+            q._list = [self.to_dict(), t.to_dict()]
 
         q._logic = logic
         return q
@@ -79,7 +84,7 @@ class Q(object):
     def __and__(self, t):
         return self.merge(t, 'must')
 
-    def __not__(self):
+    def __invert__(self):
         if len(self._list) == 1:
             q = self.clone()
             q._logic = 'must_not'
@@ -116,8 +121,11 @@ class QuerySet(object):
         self.qq = Q()
         self._extra_body = {}
         self._params = {}
-
         self._count = None
+
+        self._iter_cache = []
+        self._iter_pos = 0
+        self._iter_batch = 200
 
     def clone(self):
         qs = self.__class__(self._owner)
@@ -183,13 +191,13 @@ class QuerySet(object):
         return body
 
     def count(self):
-        if self._count is None:
-            self._count = self._es.count(index=self._index,
-                                          doc_type=self._doc_type,
-                                          body=self.to_dict(),
-                                          **self._params)['count']
+        if self._count is not None:
+            return self._count
 
-        return self._count
+        return self._es.count(index=self._index,
+                              doc_type=self._doc_type,
+                              body=self.to_dict(),
+                              **self._params)['count']
 
     def execute(self):
         result = self._es.search(index=self._index,
@@ -198,11 +206,14 @@ class QuerySet(object):
                                  **self._params)
         return result
 
-    def all(self):
-        result = self.execute()
+    def to_python(self, result):
         result = result['hits']
         self._count = result['total']
         return [self._owner.from_dict(hit) for hit in result['hits']]
+
+    def all(self):
+        result = self.execute()
+        return self.to_python(result)
 
     def first(self):
         r = self.limit(1).all()
@@ -228,7 +239,30 @@ class QuerySet(object):
             assert k >= 0
             return self.skip(k).first()
         else:
-            raise IndexError 
+            raise IndexError
+
+    def __iter__(self):
+        self._iter_pos = 0
+        self._iter_cache = []
+        return self
+
+    def __next__(self):
+        pos = self._iter_pos % self._iter_batch
+        if self._iter_pos == 0 or \
+            (pos == 0 and len(self._iter_cache) > self._iter_batch):
+            limit = self._extra_body.get('size', \
+                self._iter_pos + self._iter_batch + 1) - self._iter_pos
+            limit = min((limit, self._iter_batch + 1))
+            self._iter_cache = self.skip(self._iter_pos).limit(limit).all()
+
+        if len(self._iter_cache) <= pos:
+            raise StopIteration
+
+        r = self._iter_cache[pos]
+        self._iter_pos += 1
+        return r
+
+    next = __next__ # compatible with Python2, fuck
 
 
 class QuerySetDescriptor(object):
@@ -236,6 +270,7 @@ class QuerySetDescriptor(object):
         if not hasattr(owner, '_objects'):
             owner._objects = QuerySet(owner)
 
+        owner._objects._count = None # clear cached count
         return owner._objects
 
 
@@ -394,6 +429,7 @@ class Document(with_metaclass(DocumentMetaClass)):
         return serialized_data
 
     def update(self, **kwargs):
+        retry_on_conflict = kwargs.pop('retry_on_conflict', 0)
         self._data.update(kwargs)
         kwargs = self.serialize(kwargs)
 
@@ -401,6 +437,7 @@ class Document(with_metaclass(DocumentMetaClass)):
             index=self._meta['index'],
             doc_type=self._meta['doc_type'],
             body={'doc': kwargs},
+            retry_on_conflict=retry_on_conflict,
             **self.doc_meta
         )
 
@@ -412,11 +449,15 @@ class Document(with_metaclass(DocumentMetaClass)):
         if kwargs.pop('validate', True):
             self.validate()
 
+        extra_body = kwargs.pop('extra_body', {})
+        body = self.serialize(self._data)
+        body.update(extra_body)
+
         kwargs.update(self.doc_meta)
         result = self.get_es().index(
             index=self._meta['index'],
             doc_type=self._meta['doc_type'],
-            body=self.serialize(self._data),
+            body=body,
             **kwargs
         )
 
