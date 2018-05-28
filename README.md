@@ -16,4 +16,8 @@ class User(esq.Document):
 # query
 users = User.objects.filter(user_id__in=[1,2,3]).all()
 users = User.objects.query(name__contains='aaa').filter(created_at__gt=now).all()
+
+# logic, support and/or/invert
+q = esq.Q(name='aaa') | esq.Q(name='bbb')
+users = User.objects.filter(q).all()
 ```
